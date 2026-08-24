@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""Download Rosobrnadzor licence data with curl and store it in SQLite/CSV."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlencode
+
+BASE_URL = "https://islod.obrnadzor.gov.ru"
+USER_AGENT = "obrnadzor-downloader/1.0 (+https://github.com/pechnikov/obrnadzor)"
+
+
+def clean(text: str) -> str:
+    return " ".join(text.replace("\ufeff", "").split())
+
+
+class ListParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[dict[str, str | int]] = []
+        self.pages: list[int] = []
+        self.in_licenses = self.in_row = self.in_cell = False
+        self.cells: list[str] = []
+        self.cell: list[str] = []
+        self.license_id: int | None = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "tbody" and attributes.get("id") == "licenses":
+            self.in_licenses = True
+        elif self.in_licenses and tag == "tr":
+            self.in_row = True
+            self.cells, self.license_id = [], None
+        elif self.in_row and tag == "td":
+            self.in_cell, self.cell = True, []
+        elif self.in_cell and tag == "a":
+            match = re.fullmatch(r"/view/(\d+)", attributes.get("href", ""))
+            if match:
+                self.license_id = int(match.group(1))
+        if tag == "a":
+            match = re.search(r"search\((\d+)\)", attributes.get("onclick", ""))
+            if match:
+                self.pages.append(int(match.group(1)))
+
+    def handle_data(self, data):
+        if self.in_cell:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        if self.in_cell and tag == "td":
+            self.cells.append(clean("".join(self.cell)))
+            self.in_cell = False
+        elif self.in_row and tag == "tr":
+            if self.license_id is not None and len(self.cells) >= 5:
+                self.rows.append({
+                    "id": self.license_id, "list_name": self.cells[0],
+                    "registration_number": self.cells[1], "order_text": self.cells[2],
+                    "validity": self.cells[3], "list_status": self.cells[4],
+                })
+            self.in_row = False
+        elif self.in_licenses and tag == "tbody":
+            self.in_licenses = False
+
+
+class DetailParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.fields: dict[str, str] = {}
+        self.branches: list[dict[str, str | int]] = []
+        self.label_depth = self.field_depth = 0
+        self.label_text: list[str] = []
+        self.field_text: list[str] = []
+        self.pending_label: str | None = None
+        self.in_branch_table = self.in_row = self.in_cell = False
+        self.row_cells: list[str] = []
+        self.cell_text: list[str] = []
+        self.row_branch_id: int | None = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        if tag == "label" and "form-label" in classes:
+            self.label_depth, self.label_text = 1, []
+        elif self.label_depth and tag == "label":
+            self.label_depth += 1
+        if tag == "div" and self.pending_label and {"form-field", "disabled"} <= classes:
+            self.field_depth, self.field_text = 1, []
+        elif self.field_depth and tag == "div":
+            self.field_depth += 1
+        if tag == "table" and "tbl-list" in classes:
+            self.in_branch_table = True
+        elif self.in_branch_table and tag == "tr":
+            self.in_row, self.row_cells, self.row_branch_id = True, [], None
+        elif self.in_row and tag == "td":
+            self.in_cell, self.cell_text = True, []
+        elif self.in_cell and tag == "a":
+            match = re.fullmatch(r"/branch/(\d+)", attributes.get("href", ""))
+            if match:
+                self.row_branch_id = int(match.group(1))
+
+    def handle_data(self, data):
+        if self.label_depth:
+            self.label_text.append(data)
+        if self.field_depth:
+            self.field_text.append(data)
+        if self.in_cell:
+            self.cell_text.append(data)
+
+    def handle_endtag(self, tag):
+        if self.label_depth and tag == "label":
+            self.label_depth -= 1
+            if not self.label_depth:
+                self.pending_label = clean("".join(self.label_text))
+        if self.field_depth and tag == "div":
+            self.field_depth -= 1
+            if not self.field_depth and self.pending_label:
+                self.fields[self.pending_label] = clean("".join(self.field_text))
+                self.pending_label = None
+        if self.in_cell and tag == "td":
+            self.row_cells.append(clean("".join(self.cell_text)))
+            self.in_cell = False
+        elif self.in_row and tag == "tr":
+            if self.row_branch_id is not None and self.row_cells:
+                self.branches.append({
+                    "id": self.row_branch_id, "name": self.row_cells[0],
+                    "status": self.row_cells[1] if len(self.row_cells) > 1 else "",
+                    "order_text": self.row_cells[2] if len(self.row_cells) > 2 else "",
+                })
+            self.in_row = False
+        elif self.in_branch_table and tag == "table":
+            self.in_branch_table = False
+
+
+class ActivityParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[tuple[str, str]]]] = []
+        self.in_table = self.in_row = False
+        self.cell_tag: str | None = None
+        self.cell_text: list[str] = []
+        self.row: list[tuple[str, str]] = []
+        self.table: list[list[tuple[str, str]]] = []
+
+    def handle_starttag(self, tag, attrs):
+        classes = set((dict(attrs).get("class") or "").split())
+        if tag == "table" and "table-filled" in classes:
+            self.in_table, self.table = True, []
+        elif self.in_table and tag == "tr":
+            self.in_row, self.row = True, []
+        elif self.in_row and tag in {"th", "td"}:
+            self.cell_tag, self.cell_text = tag, []
+
+    def handle_data(self, data):
+        if self.cell_tag:
+            self.cell_text.append(data)
+
+    def handle_endtag(self, tag):
+        if self.cell_tag == tag:
+            self.row.append((tag, clean("".join(self.cell_text))))
+            self.cell_tag = None
+        elif self.in_row and tag == "tr":
+            if any(value for _, value in self.row):
+                self.table.append(self.row)
+            self.in_row = False
+        elif self.in_table and tag == "table":
+            if self.table:
+                self.tables.append(self.table)
+            self.in_table = False
+
+    def activities(self) -> list[tuple[str, str]]:
+        result: list[tuple[str, str]] = []
+        for rows in self.tables:
+            category = rows[0][0][1] if rows and rows[0] else ""
+            details: list[str] = []
+            for row in rows[1:]:
+                if row and all(tag == "th" for tag, _ in row):
+                    continue
+                values = [value for _, value in row if value]
+                if values and re.fullmatch(r"\d+", values[0]):
+                    values = values[1:]
+                if values:
+                    details.append(" — ".join(values))
+            if category:
+                result.extend((category, detail) for detail in details or [""])
+        return list(dict.fromkeys(result))
+
+
+def parse_list(source: str):
+    parser = ListParser(); parser.feed(source)
+    return parser.rows, max(parser.pages, default=None)
+
+
+def parse_detail(source: str):
+    parser = DetailParser(); parser.feed(source)
+    return parser.fields, list({int(row["id"]): row for row in parser.branches}.values())
+
+
+def parse_activities(source: str):
+    parser = ActivityParser(); parser.feed(source)
+    return parser.activities()
+
+
+SCHEMA = """
+PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS list_pages (page INTEGER PRIMARY KEY, fetched_at TEXT NOT NULL, row_count INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS licenses (
+ id INTEGER PRIMARY KEY, list_name TEXT NOT NULL DEFAULT '', registration_number TEXT NOT NULL DEFAULT '',
+ order_text TEXT NOT NULL DEFAULT '', validity TEXT NOT NULL DEFAULT '', list_status TEXT NOT NULL DEFAULT '',
+ ogrn TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT '', full_name TEXT NOT NULL DEFAULT '',
+ licensing_authority TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', short_name TEXT NOT NULL DEFAULT '',
+ inn TEXT NOT NULL DEFAULT '', kpp TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '',
+ changed_date TEXT NOT NULL DEFAULT '', detail_done INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS license_branches (
+ branch_id INTEGER PRIMARY KEY, license_id INTEGER NOT NULL REFERENCES licenses(id), name TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT '', order_text TEXT NOT NULL DEFAULT '', fetched INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS branches_license_idx ON license_branches(license_id);
+CREATE TABLE IF NOT EXISTS activities (
+ branch_id INTEGER NOT NULL REFERENCES license_branches(branch_id), category TEXT NOT NULL,
+ details TEXT NOT NULL DEFAULT '', PRIMARY KEY (branch_id, category, details));
+"""
+
+
+@dataclass(frozen=True)
+class Request:
+    key: int
+    url: str
+    output: Path
+    data: str | None = None
+
+
+class Curl:
+    def __init__(self, executable: str, parallel: int, rate: float) -> None:
+        self.executable, self.parallel, self.rate = executable, parallel, rate
+        self.next_start = time.monotonic()
+
+    @staticmethod
+    def _quoted(value: str | Path) -> str:
+        return json.dumps(str(value).replace("\\", "/"), ensure_ascii=False)
+
+    def fetch(self, requests: list[Request], workdir: Path) -> set[int]:
+        config = workdir / "curl.cfg"
+        group_size = min(self.parallel, max(1, int(self.rate)))
+        for group in chunks(requests, group_size):
+            delay = self.next_start - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            started = time.monotonic()
+            lines: list[str] = []
+            for index, request in enumerate(group):
+                lines += [
+                    f"url = {self._quoted(request.url)}", f"output = {self._quoted(request.output)}",
+                    "connect-timeout = 15", "max-time = 90", "retry = 6", "retry-all-errors",
+                    "retry-connrefused", "retry-delay = 2", "retry-max-time = 300",
+                    "fail-with-body", "remove-on-error", f"user-agent = {self._quoted(USER_AGENT)}",
+                ]
+                if request.data is not None:
+                    lines += ["request = POST", f"data = {self._quoted(request.data)}"]
+                if index + 1 < len(group):
+                    lines.append("next")
+            config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            command = [self.executable, "--silent", "--show-error", "--parallel", "--parallel-immediate",
+                       "--parallel-max", str(self.parallel), "--config", str(config)]
+            completed = subprocess.run(command, text=True, capture_output=True, check=False)
+            if completed.stderr.strip():
+                print(completed.stderr.strip(), file=sys.stderr)
+            self.next_start = started + len(group) / self.rate
+        return {request.key for request in requests if request.output.is_file()}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def get_meta(db, key):
+    row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_meta(db, key, value):
+    db.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+               (key, str(value)))
+
+
+def chunks(values: list, size: int):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def read_html(path: Path) -> str:
+    return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def download_list(db, curl, scope, batch_size, max_pages, rescan):
+    status = "6" if scope == "active" else ""
+    with tempfile.TemporaryDirectory(prefix="obrnadzor-list-") as temp:
+        tempdir = Path(temp)
+        first = Request(1, f"{BASE_URL}/search", tempdir / "1.html", urlencode({"status": status, "p": 1}))
+        curl.fetch([first], tempdir)
+        if not first.output.exists():
+            raise RuntimeError("curl did not download the first list page")
+        rows, total_pages = parse_list(read_html(first.output))
+        if not rows or not total_pages:
+            raise RuntimeError("the first list page has an unexpected format")
+        set_meta(db, "total_pages", total_pages); set_meta(db, "scope", scope); db.commit()
+        target = min(total_pages, max_pages) if max_pages else total_pages
+        done = set() if rescan else {r[0] for r in db.execute("SELECT page FROM list_pages WHERE page<=?", (target,))}
+        pending = [page for page in range(1, target + 1) if page not in done]
+        print(f"List: {target:,} pages, {len(pending):,} pending")
+        failures = 0
+        for number, batch in enumerate(chunks(pending, batch_size), 1):
+            requests = [Request(page, f"{BASE_URL}/search", tempdir / f"{page}.html",
+                                urlencode({"status": status, "p": page})) for page in batch]
+            downloaded = curl.fetch(requests, tempdir)
+            with db:
+                for request in requests:
+                    if request.key not in downloaded:
+                        failures += 1; continue
+                    page_rows, _ = parse_list(read_html(request.output))
+                    if not page_rows or len(page_rows) > 10:
+                        failures += 1; continue
+                    for row in page_rows:
+                        db.execute("""INSERT INTO licenses(id,list_name,registration_number,order_text,validity,list_status)
+                         VALUES(:id,:list_name,:registration_number,:order_text,:validity,:list_status)
+                         ON CONFLICT(id) DO UPDATE SET list_name=excluded.list_name,
+                         registration_number=excluded.registration_number,order_text=excluded.order_text,
+                         validity=excluded.validity,list_status=excluded.list_status""", row)
+                    db.execute("""INSERT INTO list_pages(page,fetched_at,row_count) VALUES(?,?,?)
+                     ON CONFLICT(page) DO UPDATE SET fetched_at=excluded.fetched_at,row_count=excluded.row_count""",
+                               (request.key, utc_now(), len(page_rows)))
+                    request.output.unlink(missing_ok=True)
+            print(f"  list batch {number}: through page {batch[-1]:,}")
+        if failures:
+            raise RuntimeError(f"{failures} list pages failed; restart the same command to resume")
+
+
+FIELD_MAP = {
+    "ОГРН": "ogrn", "Решение о предоставлении": "order_text",
+    "Текущий статус лицензии": "status",
+    "Полное наименование организации (ФИО индивидуального предпринимателя)": "full_name",
+    "Наименование органа, выдавшего лицензию": "licensing_authority", "Срок действия": "validity",
+    "Субьект РФ": "region", "Сокращенное наименование организации": "short_name",
+    "ИНН": "inn", "КПП": "kpp", "Регистрационный номер лицензии": "registration_number",
+    "Место нахождения организации": "address", "Дата внесения изменений": "changed_date",
+}
+
+
+def download_details(db, curl, batch_size):
+    ids = [r[0] for r in db.execute("SELECT id FROM licenses WHERE detail_done=0 ORDER BY id")]
+    print(f"Details: {len(ids):,} pending")
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="obrnadzor-details-") as temp:
+        tempdir = Path(temp)
+        for number, batch in enumerate(chunks(ids, batch_size), 1):
+            requests = [Request(item, f"{BASE_URL}/view/{item}", tempdir / f"{item}.html") for item in batch]
+            downloaded = curl.fetch(requests, tempdir)
+            with db:
+                for request in requests:
+                    if request.key not in downloaded:
+                        failures += 1; continue
+                    fields, branches = parse_detail(read_html(request.output))
+                    if "Текущий статус лицензии" not in fields or "ИНН" not in fields:
+                        failures += 1; continue
+                    values = {column: fields.get(label, "") for label, column in FIELD_MAP.items()}
+                    assignments = ",".join(f"{column}=?" for column in values)
+                    db.execute(f"UPDATE licenses SET {assignments},detail_done=1 WHERE id=?",
+                               (*values.values(), request.key))
+                    for branch in branches:
+                        db.execute("""INSERT INTO license_branches(branch_id,license_id,name,status,order_text)
+                         VALUES(?,?,?,?,?) ON CONFLICT(branch_id) DO UPDATE SET license_id=excluded.license_id,
+                         name=excluded.name,status=excluded.status,order_text=excluded.order_text""",
+                                   (branch["id"], request.key, branch["name"], branch["status"], branch["order_text"]))
+                    request.output.unlink(missing_ok=True)
+            print(f"  details batch {number}: {min(number * batch_size, len(ids)):,}/{len(ids):,}")
+        if failures:
+            raise RuntimeError(f"{failures} detail pages failed; restart the same command to resume")
+
+
+def download_activities(db, curl, batch_size):
+    ids = [r[0] for r in db.execute("SELECT branch_id FROM license_branches WHERE fetched=0 ORDER BY branch_id")]
+    print(f"Activities: {len(ids):,} branch pages pending")
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="obrnadzor-activities-") as temp:
+        tempdir = Path(temp)
+        for number, batch in enumerate(chunks(ids, batch_size), 1):
+            requests = [Request(item, f"{BASE_URL}/branch/{item}", tempdir / f"{item}.html") for item in batch]
+            downloaded = curl.fetch(requests, tempdir)
+            with db:
+                for request in requests:
+                    if request.key not in downloaded:
+                        failures += 1; continue
+                    source = read_html(request.output)
+                    if "Полное наименование организации" not in source:
+                        failures += 1; continue
+                    db.execute("DELETE FROM activities WHERE branch_id=?", (request.key,))
+                    db.executemany("INSERT OR IGNORE INTO activities(branch_id,category,details) VALUES(?,?,?)",
+                                   [(request.key, *item) for item in parse_activities(source)])
+                    db.execute("UPDATE license_branches SET fetched=1 WHERE branch_id=?", (request.key,))
+                    request.output.unlink(missing_ok=True)
+            print(f"  activities batch {number}: {min(number * batch_size, len(ids)):,}/{len(ids):,}")
+        if failures:
+            raise RuntimeError(f"{failures} branch pages failed; restart the same command to resume")
+
+
+CSV_COLUMNS = ["ID", "URL", "ИНН", "Название организации полное", "Название организации сокращенное",
+               "Статус", "Рег.номер", "Приказ", "Срок действия", "КПП", "Адрес", "Дата изменений",
+               "Виды деятельности"]
+
+
+def atomic_csv(path, rows, columns):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream); writer.writerow(columns); writer.writerows(rows)
+    os.replace(temporary, path)
+
+
+def export_csv(db, output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def full_rows():
+        query = """SELECT l.id,l.inn,COALESCE(NULLIF(l.full_name,''),l.list_name),l.short_name,
+         COALESCE(NULLIF(l.status,''),l.list_status),l.registration_number,l.order_text,
+         l.validity,l.kpp,l.address,l.changed_date,a.category,a.details FROM licenses l
+         LEFT JOIN license_branches b ON b.license_id=l.id LEFT JOIN activities a ON a.branch_id=b.branch_id
+         ORDER BY l.id,a.category,a.details"""
+        current, activities = None, []
+        for row in db.execute(query):
+            if current is not None and row[0] != current[0]:
+                yield [current[0], f"{BASE_URL}/view/{current[0]}", *current[1:], "; ".join(dict.fromkeys(activities))]
+                activities = []
+            if current is None or row[0] != current[0]:
+                current = list(row[:11])
+            if row[11]:
+                activities.append(f"{row[11]}: {row[12]}" if row[12] else row[11])
+        if current is not None:
+            yield [current[0], f"{BASE_URL}/view/{current[0]}", *current[1:], "; ".join(dict.fromkeys(activities))]
+
+    atomic_csv(output_dir / "licenses.csv", full_rows(), CSV_COLUMNS)
+    minimal = db.execute("""SELECT DISTINCT inn,COALESCE(NULLIF(full_name,''),list_name) AS name FROM licenses
+     WHERE COALESCE(NULLIF(status,''),list_status)='Действующая' AND inn<>''
+     AND COALESCE(NULLIF(full_name,''),list_name)<>'' ORDER BY inn,name""")
+    atomic_csv(output_dir / "active_inn_name.csv", minimal, ["ИНН", "Название"])
+    print(f"CSV: {output_dir / 'licenses.csv'}\nCSV minimum: {output_dir / 'active_inn_name.csv'}")
+
+
+def print_request_plan(db, rate, include_branches):
+    pages = db.execute("SELECT count(*) FROM list_pages").fetchone()[0]
+    licenses = db.execute("SELECT count(*) FROM licenses").fetchone()[0]
+    branches = db.execute("SELECT count(*) FROM license_branches").fetchone()[0] if include_branches else 0
+    total = pages + licenses + branches
+    print(f"Request plan: {pages:,} list + {licenses:,} details + {branches:,} branches = {total:,}")
+    print(f"Theoretical transfer time at {rate:g}/s: {total / rate / 3600:.2f} h")
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path, default=Path("data"))
+    parser.add_argument("--scope", choices=("active", "all"), default="active",
+                        help="active fits the requested 8-hour window; all is much larger")
+    parser.add_argument("--minimal", action="store_true", help="skip activity branch pages")
+    parser.add_argument("--rate", type=float, default=16.0, help="maximum curl request starts per second")
+    parser.add_argument("--parallel", type=int, default=4, help="maximum simultaneous curl transfers")
+    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--max-pages", type=int, help="download only this many list pages (smoke test)")
+    parser.add_argument("--rescan-list", action="store_true", help="refresh downloaded list pages")
+    parser.add_argument("--export-only", action="store_true")
+    parser.add_argument("--curl", default="curl.exe" if os.name == "nt" else "curl")
+    args = parser.parse_args()
+    if args.rate <= 0 or args.parallel <= 0 or args.batch_size <= 0:
+        parser.error("--rate, --parallel and --batch-size must be positive")
+    return args
+
+
+def main():
+    args = arguments()
+    curl_path = shutil.which(args.curl)
+    if not curl_path:
+        raise SystemExit(f"curl not found: {args.curl}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    database = args.output_dir / "licenses.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        old_scope = get_meta(db, "scope")
+        if old_scope and old_scope != args.scope and not args.export_only:
+            raise SystemExit(f"database scope is {old_scope!r}; use another --output-dir for {args.scope!r}")
+        if not args.export_only:
+            curl = Curl(curl_path, args.parallel, args.rate)
+            started = time.monotonic()
+            download_list(db, curl, args.scope, args.batch_size, args.max_pages, args.rescan_list)
+            download_details(db, curl, args.batch_size)
+            print_request_plan(db, args.rate, not args.minimal)
+            if not args.minimal:
+                download_activities(db, curl, args.batch_size)
+            print(f"Download time: {(time.monotonic() - started) / 3600:.2f} h")
+        export_csv(db, args.output_dir)
+        print(f"SQLite: {database}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
