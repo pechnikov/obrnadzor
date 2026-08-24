@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -22,6 +23,12 @@ from urllib.parse import urlencode
 
 BASE_URL = "https://islod.obrnadzor.gov.ru"
 USER_AGENT = "obrnadzor-downloader/1.0 (+https://github.com/pechnikov/obrnadzor)"
+REQUEST_HEADERS = (
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language: ru-RU,ru;q=0.9,en;q=0.5",
+    "Referer: https://islod.obrnadzor.gov.ru/rlic/",
+)
+TIMEOUT_RETRY_SECONDS = 40
 
 
 def clean(text: str) -> str:
@@ -244,41 +251,101 @@ class Request:
 
 
 class Curl:
-    def __init__(self, executable: str, parallel: int, rate: float) -> None:
+    def __init__(self, executable: str, parallel: int, rate: float, cookie_file: Path,
+                 cooldown: int = TIMEOUT_RETRY_SECONDS, stream=None) -> None:
         self.executable, self.parallel, self.rate = executable, parallel, rate
+        self.cookie_file, self.cooldown = cookie_file, cooldown
+        self.stream = stream if stream is not None else sys.stdout
+        self.interactive = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.status_width = 0
         self.next_start = time.monotonic()
+        self.cookie_file.touch(exist_ok=True)
 
     @staticmethod
     def _quoted(value: str | Path) -> str:
         return json.dumps(str(value).replace("\\", "/"), ensure_ascii=False)
 
-    def fetch(self, requests: list[Request], workdir: Path) -> set[int]:
+    def _run(self, requests: list[Request], config: Path, tick=None) -> tuple[set[int], bool]:
+        lines: list[str] = []
+        for index, request in enumerate(requests):
+            lines += [
+                f"url = {self._quoted(request.url)}", f"output = {self._quoted(request.output)}",
+                "connect-timeout = 15", "max-time = 90", "fail-with-body", "remove-on-error",
+                "compressed", f"user-agent = {self._quoted(USER_AGENT)}",
+                f"cookie = {self._quoted(self.cookie_file)}",
+                f"cookie-jar = {self._quoted(self.cookie_file)}",
+                *(f"header = {self._quoted(header)}" for header in REQUEST_HEADERS),
+            ]
+            if request.data is not None:
+                lines += ["request = POST", f"data = {self._quoted(request.data)}"]
+            if index + 1 < len(requests):
+                lines.append("next")
+        config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        command = [self.executable, "--silent", "--show-error"]
+        if len(requests) > 1:
+            command += ["--parallel", "--parallel-max", str(self.parallel)]
+        command += ["--config", str(config)]
+        process = subprocess.Popen(command, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        while True:
+            try:
+                _, errors = process.communicate(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                if tick:
+                    tick()
+        error_lines = [line for line in errors.splitlines() if "curl: (28)" not in line]
+        if error_lines:
+            print("\n".join(error_lines), file=sys.stderr)
+        return ({request.key for request in requests if request.output.is_file()}, "curl: (28)" in errors)
+
+    def _timeout_status(self, started: float, retries: int, suffix: str, force: bool = False) -> None:
+        line = f"Timeouts       {format_duration(time.monotonic() - started)} | retries: {retries} | {suffix}"
+        if self.interactive:
+            self.status_width = max(self.status_width, len(line))
+            print(f"\r{line:<{self.status_width}}", end="", file=self.stream, flush=True)
+        elif force:
+            print(line, file=self.stream, flush=True)
+
+    def _recover(self, request: Request, config: Path) -> None:
+        started, retries = time.monotonic(), 0
+        next_retry = started + self.cooldown
+        while True:
+            first_status = True
+            while (remaining := next_retry - time.monotonic()) > 0:
+                self._timeout_status(started, retries, f"next retry in {math.ceil(remaining)}s", force=first_status)
+                first_status = False
+                time.sleep(min(1, remaining))
+            retries += 1
+            attempt_started = time.monotonic()
+            tick = lambda: self._timeout_status(started, retries, "retry in progress")
+            downloaded, _ = self._run([request], config, tick)
+            if request.key in downloaded:
+                message = f"Connection restored after {format_duration(time.monotonic() - started)}, retries: {retries}"
+                if self.interactive:
+                    print(f"\r{message:<{self.status_width}}", file=self.stream, flush=True)
+                else:
+                    print(message, file=self.stream, flush=True)
+                self.next_start = time.monotonic() + 1 / self.rate
+                return
+            next_retry = attempt_started + self.cooldown
+
+    def fetch(self, requests: list[Request], workdir: Path, tick=None) -> set[int]:
         config = workdir / "curl.cfg"
         group_size = min(self.parallel, max(1, int(self.rate)))
         for group in chunks(requests, group_size):
-            delay = self.next_start - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            started = time.monotonic()
-            lines: list[str] = []
-            for index, request in enumerate(group):
-                lines += [
-                    f"url = {self._quoted(request.url)}", f"output = {self._quoted(request.output)}",
-                    "connect-timeout = 15", "max-time = 90", "retry = 6", "retry-all-errors",
-                    "retry-connrefused", "retry-delay = 2", "retry-max-time = 300",
-                    "fail-with-body", "remove-on-error", f"user-agent = {self._quoted(USER_AGENT)}",
-                ]
-                if request.data is not None:
-                    lines += ["request = POST", f"data = {self._quoted(request.data)}"]
-                if index + 1 < len(group):
-                    lines.append("next")
-            config.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            command = [self.executable, "--silent", "--show-error", "--parallel", "--parallel-immediate",
-                       "--parallel-max", str(self.parallel), "--config", str(config)]
-            completed = subprocess.run(command, text=True, capture_output=True, check=False)
-            if completed.stderr.strip():
-                print(completed.stderr.strip(), file=sys.stderr)
-            self.next_start = started + len(group) / self.rate
+            pending = group
+            while pending:
+                delay = self.next_start - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                started = time.monotonic()
+                downloaded, timed_out = self._run(pending, config, tick)
+                self.next_start = started + len(pending) / self.rate
+                pending = [request for request in pending if request.key not in downloaded]
+                if not pending or not timed_out:
+                    break
+                self._recover(pending[0], config)
+                pending = [request for request in pending if not request.output.is_file()]
         return {request.key for request in requests if request.output.is_file()}
 
 
@@ -325,6 +392,10 @@ class Progress:
     def advance(self, count: int) -> None:
         self.completed += count
         self._render()
+
+    def refresh(self) -> None:
+        if self.interactive and not self.closed:
+            self._render()
 
     def close(self) -> None:
         if self.interactive and not self.closed:
@@ -373,7 +444,7 @@ def download_list(db, curl, scope, batch_size, max_pages, rescan):
         for batch in chunks(pending, batch_size):
             requests = [Request(page, f"{BASE_URL}/search", tempdir / f"{page}.html",
                                 urlencode({"status": status, "p": page})) for page in batch]
-            downloaded = curl.fetch(requests, tempdir)
+            downloaded = curl.fetch(requests, tempdir, progress.refresh)
             completed = 0
             with db:
                 for request in requests:
@@ -419,7 +490,7 @@ def download_details(db, curl, batch_size):
         tempdir = Path(temp)
         for batch in chunks(ids, batch_size):
             requests = [Request(item, f"{BASE_URL}/view/{item}", tempdir / f"{item}.html") for item in batch]
-            downloaded = curl.fetch(requests, tempdir)
+            downloaded = curl.fetch(requests, tempdir, progress.refresh)
             completed = 0
             with db:
                 for request in requests:
@@ -454,7 +525,7 @@ def download_activities(db, curl, batch_size):
         tempdir = Path(temp)
         for batch in chunks(ids, batch_size):
             requests = [Request(item, f"{BASE_URL}/branch/{item}", tempdir / f"{item}.html") for item in batch]
-            downloaded = curl.fetch(requests, tempdir)
+            downloaded = curl.fetch(requests, tempdir, progress.refresh)
             completed = 0
             with db:
                 for request in requests:
@@ -529,11 +600,11 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path("data"))
     parser.add_argument("--scope", choices=("active", "all"), default="active",
-                        help="active fits the requested 8-hour window; all is much larger")
+                        help="active licenses only; all is much larger")
     parser.add_argument("--minimal", action="store_true", help="skip activity branch pages")
-    parser.add_argument("--rate", type=float, default=16.0, help="maximum curl request starts per second")
+    parser.add_argument("--rate", type=float, default=8.0, help="maximum curl request starts per second")
     parser.add_argument("--parallel", type=int, default=4, help="maximum simultaneous curl transfers")
-    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=16, help="requests between progress updates")
     parser.add_argument("--max-pages", type=int, help="download only this many list pages (smoke test)")
     parser.add_argument("--rescan-list", action="store_true", help="refresh downloaded list pages")
     parser.add_argument("--export-only", action="store_true")
@@ -557,7 +628,7 @@ def main():
         if old_scope and old_scope != args.scope and not args.export_only:
             raise SystemExit(f"database scope is {old_scope!r}; use another --output-dir for {args.scope!r}")
         if not args.export_only:
-            curl = Curl(curl_path, args.parallel, args.rate)
+            curl = Curl(curl_path, args.parallel, args.rate, args.output_dir / ".curl-cookies.txt")
             started = time.monotonic()
             download_list(db, curl, args.scope, args.batch_size, args.max_pages, args.rescan_list)
             download_details(db, curl, args.batch_size)

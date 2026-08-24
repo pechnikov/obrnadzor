@@ -1,7 +1,9 @@
 import io
+import tempfile
 import unittest
+from pathlib import Path
 
-from obrnadzor import Progress, format_duration, parse_activities, parse_detail, parse_list
+from obrnadzor import Curl, Progress, Request, format_duration, parse_activities, parse_detail, parse_list
 
 
 class ParserTests(unittest.TestCase):
@@ -51,6 +53,26 @@ class ParserTests(unittest.TestCase):
         finished = io.StringIO()
         Progress("List", 1, 1, finished)
         self.assertIn("ETA 00:00:00", finished.getvalue())
+
+    def test_timeout_recovery(self):
+        class RecoveringCurl(Curl):
+            def _run(self, requests, config, tick=None):
+                self.calls += 1
+                if tick:
+                    tick()
+                if self.calls == 3:
+                    requests[0].output.write_text("ok", encoding="utf-8")
+                downloaded = {request.key for request in requests if request.output.is_file()}
+                return downloaded, not downloaded
+
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            curl = RecoveringCurl("curl", 1, 8, directory / "cookies.txt", cooldown=0, stream=io.StringIO())
+            curl.calls = 0
+            request = Request(1, "https://example.invalid", directory / "1.html")
+            self.assertEqual({1}, curl.fetch([request], directory))
+            self.assertEqual(3, curl.calls)
+            self.assertIn("Connection restored", curl.stream.getvalue())
 
 
 if __name__ == "__main__":
