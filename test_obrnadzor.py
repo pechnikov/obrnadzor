@@ -57,7 +57,7 @@ class ParserTests(unittest.TestCase):
 
     def test_timeout_recovery(self):
         class RecoveringCurl(Curl):
-            def _run(self, requests, config, tick=None):
+            def _run(self, requests, config, rate=None, cookie_file=None, tick=None):
                 self.calls += 1
                 if tick:
                     tick()
@@ -90,6 +90,25 @@ class ParserTests(unittest.TestCase):
             command = popen.call_args.args[0]
             self.assertNotIn("--parallel", command)
             self.assertEqual("8/s", command[command.index("--rate") + 1])
+
+    def test_three_workers_share_global_rate(self):
+        class RecordingCurl(Curl):
+            def _run(self, requests, config, rate=None, cookie_file=None, tick=None):
+                self.calls.append((len(requests), config, rate, cookie_file))
+                for request in requests:
+                    request.output.write_text("ok", encoding="utf-8")
+                return {request.key for request in requests}, False
+
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            curl = RecordingCurl("curl", 8, directory / "cookies.txt")
+            curl.calls = []
+            requests = [Request(i, f"https://example.invalid/{i}", directory / f"{i}.html")
+                        for i in range(9)]
+            self.assertEqual(set(range(9)), curl.fetch(requests, directory))
+            self.assertEqual([2, 3, 3], sorted(call[2] for call in curl.calls))
+            self.assertEqual(3, len({call[1] for call in curl.calls}))
+            self.assertEqual(3, len({call[3] for call in curl.calls}))
 
 
 if __name__ == "__main__":

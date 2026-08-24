@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -29,6 +30,7 @@ REQUEST_HEADERS = (
     "Referer: https://islod.obrnadzor.gov.ru/rlic/",
 )
 TIMEOUT_RETRY_SECONDS = 40
+WORKERS = 3
 
 
 def clean(text: str) -> str:
@@ -252,27 +254,33 @@ class Request:
 
 class Curl:
     def __init__(self, executable: str, rate: int, cookie_file: Path,
-                 cooldown: int = TIMEOUT_RETRY_SECONDS, stream=None) -> None:
-        self.executable, self.rate = executable, rate
-        self.cookie_file, self.cooldown = cookie_file, cooldown
+                 cooldown: int = TIMEOUT_RETRY_SECONDS, stream=None, workers: int = WORKERS) -> None:
+        self.executable, self.rate, self.workers = executable, rate, workers
+        self.cooldown = cooldown
         self.stream = stream if stream is not None else sys.stdout
         self.interactive = bool(getattr(self.stream, "isatty", lambda: False)())
         self.status_width = 0
-        self.cookie_file.touch(exist_ok=True)
+        self.cookie_files = [cookie_file.with_name(f"{cookie_file.stem}-{number}{cookie_file.suffix}")
+                             for number in range(1, workers + 1)]
+        for path in self.cookie_files:
+            path.touch(exist_ok=True)
 
     @staticmethod
     def _quoted(value: str | Path) -> str:
         return json.dumps(str(value).replace("\\", "/"), ensure_ascii=False)
 
-    def _run(self, requests: list[Request], config: Path, tick=None) -> tuple[set[int], bool]:
+    def _run(self, requests: list[Request], config: Path, rate=None, cookie_file=None,
+             tick=None) -> tuple[set[int], bool]:
+        rate = rate or self.rate
+        cookie_file = cookie_file or self.cookie_files[0]
         lines: list[str] = []
         for index, request in enumerate(requests):
             lines += [
                 f"url = {self._quoted(request.url)}", f"output = {self._quoted(request.output)}",
                 "connect-timeout = 15", "max-time = 90", "fail-with-body", "remove-on-error",
                 "compressed", f"user-agent = {self._quoted(USER_AGENT)}",
-                f"cookie = {self._quoted(self.cookie_file)}",
-                f"cookie-jar = {self._quoted(self.cookie_file)}",
+                f"cookie = {self._quoted(cookie_file)}",
+                f"cookie-jar = {self._quoted(cookie_file)}",
                 *(f"header = {self._quoted(header)}" for header in REQUEST_HEADERS),
             ]
             if request.data is not None:
@@ -281,7 +289,7 @@ class Curl:
                 lines.append("next")
         config.write_text("\n".join(lines) + "\n", encoding="utf-8")
         command = [self.executable, "--silent", "--show-error", "--fail-early",
-                   "--rate", f"{self.rate}/s", "--config", str(config)]
+                   "--rate", f"{rate}/s", "--config", str(config)]
         process = subprocess.Popen(command, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         while True:
             try:
@@ -318,7 +326,7 @@ class Curl:
             retries += 1
             attempt_started = time.monotonic()
             tick = lambda: self._timeout_status(started, retries, "retry in progress")
-            downloaded, _ = self._run([request], config, tick)
+            downloaded, _ = self._run([request], config, self.rate, self.cookie_files[0], tick)
             if request.key in downloaded:
                 message = f"Connection restored after {format_duration(time.monotonic() - started)}, retries: {retries}"
                 if self.interactive:
@@ -329,14 +337,23 @@ class Curl:
             next_retry = attempt_started + self.cooldown
 
     def fetch(self, requests: list[Request], workdir: Path, tick=None) -> set[int]:
-        config = workdir / "curl.cfg"
         pending = requests
         while pending:
-            downloaded, timed_out = self._run(pending, config, tick)
+            active = min(self.workers, self.rate, len(pending))
+            base_rate, faster_workers = divmod(self.rate, active)
+            groups = [pending[number::active] for number in range(active)]
+            with ThreadPoolExecutor(max_workers=active) as pool:
+                futures = [pool.submit(self._run, group, workdir / f"curl-{number + 1}.cfg",
+                                       base_rate + (number < faster_workers), self.cookie_files[number],
+                                       tick if number == 0 else None)
+                           for number, group in enumerate(groups)]
+                results = [future.result() for future in futures]
+            downloaded = set().union(*(result[0] for result in results))
+            timed_out = any(result[1] for result in results)
             pending = [request for request in pending if request.key not in downloaded]
             if not pending or not timed_out:
                 break
-            self._recover(pending[0], config)
+            self._recover(pending[0], workdir / "curl-recovery.cfg")
             pending = [request for request in pending if not request.output.is_file()]
         return {request.key for request in requests if request.output.is_file()}
 
