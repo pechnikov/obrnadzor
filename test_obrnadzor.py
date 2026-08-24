@@ -2,6 +2,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from obrnadzor import Curl, Progress, Request, format_duration, parse_activities, parse_detail, parse_list
 
@@ -67,12 +68,27 @@ class ParserTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
-            curl = RecoveringCurl("curl", 1, 8, directory / "cookies.txt", cooldown=0, stream=io.StringIO())
+            curl = RecoveringCurl("curl", 8, directory / "cookies.txt", cooldown=0, stream=io.StringIO())
             curl.calls = 0
             request = Request(1, "https://example.invalid", directory / "1.html")
             self.assertEqual({1}, curl.fetch([request], directory))
             self.assertEqual(3, curl.calls)
             self.assertIn("Connection restored", curl.stream.getvalue())
+
+    def test_curl_is_sequential_and_rate_limited(self):
+        class FinishedProcess:
+            def communicate(self, timeout=None):
+                return None, ""
+
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            curl = Curl("curl", 8, directory / "cookies.txt")
+            requests = [Request(i, f"https://example.invalid/{i}", directory / f"{i}.html") for i in range(2)]
+            with patch("obrnadzor.subprocess.Popen", return_value=FinishedProcess()) as popen:
+                curl._run(requests, directory / "curl.cfg")
+            command = popen.call_args.args[0]
+            self.assertNotIn("--parallel", command)
+            self.assertEqual("8/s", command[command.index("--rate") + 1])
 
 
 if __name__ == "__main__":

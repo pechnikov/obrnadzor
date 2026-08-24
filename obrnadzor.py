@@ -251,14 +251,13 @@ class Request:
 
 
 class Curl:
-    def __init__(self, executable: str, parallel: int, rate: float, cookie_file: Path,
+    def __init__(self, executable: str, rate: int, cookie_file: Path,
                  cooldown: int = TIMEOUT_RETRY_SECONDS, stream=None) -> None:
-        self.executable, self.parallel, self.rate = executable, parallel, rate
+        self.executable, self.rate = executable, rate
         self.cookie_file, self.cooldown = cookie_file, cooldown
         self.stream = stream if stream is not None else sys.stdout
         self.interactive = bool(getattr(self.stream, "isatty", lambda: False)())
         self.status_width = 0
-        self.next_start = time.monotonic()
         self.cookie_file.touch(exist_ok=True)
 
     @staticmethod
@@ -281,10 +280,8 @@ class Curl:
             if index + 1 < len(requests):
                 lines.append("next")
         config.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        command = [self.executable, "--silent", "--show-error"]
-        if len(requests) > 1:
-            command += ["--parallel", "--parallel-max", str(self.parallel)]
-        command += ["--config", str(config)]
+        command = [self.executable, "--silent", "--show-error", "--fail-early",
+                   "--rate", f"{self.rate}/s", "--config", str(config)]
         process = subprocess.Popen(command, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         while True:
             try:
@@ -325,27 +322,19 @@ class Curl:
                     print(f"\r{message:<{self.status_width}}", file=self.stream, flush=True)
                 else:
                     print(message, file=self.stream, flush=True)
-                self.next_start = time.monotonic() + 1 / self.rate
                 return
             next_retry = attempt_started + self.cooldown
 
     def fetch(self, requests: list[Request], workdir: Path, tick=None) -> set[int]:
         config = workdir / "curl.cfg"
-        group_size = min(self.parallel, max(1, int(self.rate)))
-        for group in chunks(requests, group_size):
-            pending = group
-            while pending:
-                delay = self.next_start - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-                started = time.monotonic()
-                downloaded, timed_out = self._run(pending, config, tick)
-                self.next_start = started + len(pending) / self.rate
-                pending = [request for request in pending if request.key not in downloaded]
-                if not pending or not timed_out:
-                    break
-                self._recover(pending[0], config)
-                pending = [request for request in pending if not request.output.is_file()]
+        pending = requests
+        while pending:
+            downloaded, timed_out = self._run(pending, config, tick)
+            pending = [request for request in pending if request.key not in downloaded]
+            if not pending or not timed_out:
+                break
+            self._recover(pending[0], config)
+            pending = [request for request in pending if not request.output.is_file()]
         return {request.key for request in requests if request.output.is_file()}
 
 
@@ -602,16 +591,15 @@ def arguments():
     parser.add_argument("--scope", choices=("active", "all"), default="active",
                         help="active licenses only; all is much larger")
     parser.add_argument("--minimal", action="store_true", help="skip activity branch pages")
-    parser.add_argument("--rate", type=float, default=8.0, help="maximum curl request starts per second")
-    parser.add_argument("--parallel", type=int, default=4, help="maximum simultaneous curl transfers")
+    parser.add_argument("--rate", type=int, default=8, help="maximum sequential curl request starts per second")
     parser.add_argument("--batch-size", type=int, default=16, help="requests between progress updates")
     parser.add_argument("--max-pages", type=int, help="download only this many list pages (smoke test)")
     parser.add_argument("--rescan-list", action="store_true", help="refresh downloaded list pages")
     parser.add_argument("--export-only", action="store_true")
     parser.add_argument("--curl", default="curl.exe" if os.name == "nt" else "curl")
     args = parser.parse_args()
-    if args.rate <= 0 or args.parallel <= 0 or args.batch_size <= 0:
-        parser.error("--rate, --parallel and --batch-size must be positive")
+    if args.rate <= 0 or args.batch_size <= 0:
+        parser.error("--rate and --batch-size must be positive")
     return args
 
 
@@ -628,7 +616,7 @@ def main():
         if old_scope and old_scope != args.scope and not args.export_only:
             raise SystemExit(f"database scope is {old_scope!r}; use another --output-dir for {args.scope!r}")
         if not args.export_only:
-            curl = Curl(curl_path, args.parallel, args.rate, args.output_dir / ".curl-cookies.txt")
+            curl = Curl(curl_path, args.rate, args.output_dir / ".curl-cookies.txt")
             started = time.monotonic()
             download_list(db, curl, args.scope, args.batch_size, args.max_pages, args.rescan_list)
             download_details(db, curl, args.batch_size)
