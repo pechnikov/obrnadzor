@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Check the active-license list by region without modifying the main database."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sqlite3
+import tempfile
+from contextlib import closing
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlencode
+
+from obrnadzor import (BASE_URL, Curl, Progress, Request, atomic_csv, clean, local_now,
+                       parse_list, read_html, utc_now)
+
+
+SCHEMA = """
+PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS regions (
+ code TEXT PRIMARY KEY, name TEXT NOT NULL, total_pages INTEGER NOT NULL, discovered_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pages (
+ region_code TEXT NOT NULL REFERENCES regions(code), page INTEGER NOT NULL,
+ fetched_at TEXT NOT NULL, row_count INTEGER NOT NULL, PRIMARY KEY(region_code,page));
+CREATE TABLE IF NOT EXISTS page_rows (
+ region_code TEXT NOT NULL, page INTEGER NOT NULL, position INTEGER NOT NULL, license_id INTEGER NOT NULL,
+ list_name TEXT NOT NULL, registration_number TEXT NOT NULL, order_text TEXT NOT NULL,
+ validity TEXT NOT NULL, list_status TEXT NOT NULL,
+ PRIMARY KEY(region_code,page,position), FOREIGN KEY(region_code,page) REFERENCES pages(region_code,page));
+CREATE INDEX IF NOT EXISTS control_license_idx ON page_rows(license_id);
+"""
+
+
+class RegionParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_regions = self.in_option = False
+        self.value = ""
+        self.text: list[str] = []
+        self.regions: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "select" and attributes.get("id") == "region":
+            self.in_regions = True
+        elif self.in_regions and tag == "option":
+            self.in_option = True
+            self.value, self.text = attributes.get("value", ""), []
+
+    def handle_data(self, data):
+        if self.in_option:
+            self.text.append(data)
+
+    def handle_endtag(self, tag):
+        if self.in_option and tag == "option":
+            if self.value:
+                self.regions.append((self.value, clean("".join(self.text))))
+            self.in_option = False
+        elif self.in_regions and tag == "select":
+            self.in_regions = False
+
+
+def parse_regions(source: str) -> list[tuple[str, str]]:
+    parser = RegionParser()
+    parser.feed(source)
+    return list(dict.fromkeys(parser.regions))
+
+
+def save_page(db, region_code: str, page: int, rows: list[dict]) -> None:
+    db.execute("DELETE FROM page_rows WHERE region_code=? AND page=?", (region_code, page))
+    db.execute("""INSERT INTO pages(region_code,page,fetched_at,row_count) VALUES(?,?,?,?)
+                ON CONFLICT(region_code,page) DO UPDATE SET
+                fetched_at=excluded.fetched_at,row_count=excluded.row_count""",
+               (region_code, page, utc_now(), len(rows)))
+    db.executemany("""INSERT INTO page_rows(region_code,page,position,license_id,list_name,
+                    registration_number,order_text,validity,list_status) VALUES(?,?,?,?,?,?,?,?,?)""",
+                   [(region_code, page, position, row["id"], row["list_name"],
+                     row["registration_number"], row["order_text"], row["validity"], row["list_status"])
+                    for position, row in enumerate(rows, 1)])
+
+
+def search_request(key: int, region_code: str, page: int, tempdir: Path) -> Request:
+    data = urlencode({"status": "6", "region": region_code, "p": page})
+    return Request(key, f"{BASE_URL}/search", tempdir / f"{region_code}-{page}.html", data)
+
+
+def discover_regions(curl: Curl, tempdir: Path) -> list[tuple[str, str]]:
+    request = Request(0, f"{BASE_URL}/rlic/", tempdir / "regions.html")
+    if 0 not in curl.fetch([request], tempdir):
+        raise RuntimeError("could not download the region list")
+    regions = parse_regions(read_html(request.output))
+    if len(regions) < 80:
+        raise RuntimeError(f"unexpected region list: {len(regions)} entries")
+    return regions
+
+
+def discover_totals(db, curl: Curl, regions: list[tuple[str, str]], batch_size: int, tempdir: Path) -> None:
+    known = {row[0] for row in db.execute("SELECT code FROM regions")}
+    with db:
+        for code, name in regions:
+            if code in known:
+                db.execute("UPDATE regions SET name=? WHERE code=?", (name, code))
+    pending = [(number, code, name) for number, (code, name) in enumerate(regions, 1) if code not in known]
+    progress = Progress("Regions", len(regions), len(regions) - len(pending))
+    failures = 0
+    for start in range(0, len(pending), batch_size):
+        batch = pending[start:start + batch_size]
+        requests = [search_request(number, code, 1, tempdir) for number, code, _ in batch]
+        downloaded = curl.fetch(requests, tempdir, progress.refresh)
+        completed = 0
+        with db:
+            for request, (_, code, name) in zip(requests, batch):
+                if request.key not in downloaded:
+                    failures += 1
+                    continue
+                source = read_html(request.output)
+                rows, reported_pages = parse_list(source)
+                if 'id="licenses"' not in source or len(rows) > 10:
+                    failures += 1
+                    continue
+                total_pages = reported_pages or (1 if rows else 0)
+                db.execute("INSERT INTO regions(code,name,total_pages,discovered_at) VALUES(?,?,?,?)",
+                           (code, name, total_pages, utc_now()))
+                if rows:
+                    save_page(db, code, 1, rows)
+                request.output.unlink(missing_ok=True)
+                completed += 1
+        progress.advance(completed)
+    progress.close()
+    if failures:
+        raise RuntimeError(f"{failures} region discovery requests failed; restart to resume")
+
+
+def download_pages(db, curl: Curl, batch_size: int, tempdir: Path) -> None:
+    region_pages = list(db.execute("SELECT code,total_pages FROM regions ORDER BY code"))
+    total = sum(row[1] for row in region_pages)
+    completed = db.execute("SELECT count(*) FROM pages").fetchone()[0]
+    progress = Progress("Regional pages", total, completed)
+    failures = 0
+    for code, total_pages in region_pages:
+        done = {row[0] for row in db.execute("SELECT page FROM pages WHERE region_code=?", (code,))}
+        pending = [page for page in range(1, total_pages + 1) if page not in done]
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start:start + batch_size]
+            requests = [search_request(page, code, page, tempdir) for page in batch]
+            downloaded = curl.fetch(requests, tempdir, progress.refresh)
+            batch_completed = 0
+            with db:
+                for request in requests:
+                    if request.key not in downloaded:
+                        failures += 1
+                        continue
+                    rows, reported_pages = parse_list(read_html(request.output))
+                    if not rows or len(rows) > 10 or (reported_pages and reported_pages != total_pages):
+                        failures += 1
+                        continue
+                    save_page(db, code, request.key, rows)
+                    request.output.unlink(missing_ok=True)
+                    batch_completed += 1
+            progress.advance(batch_completed)
+    progress.close()
+    if failures:
+        raise RuntimeError(f"{failures} regional pages failed; restart to resume")
+    actual = db.execute("SELECT count(*) FROM pages").fetchone()[0]
+    if actual != total:
+        raise RuntimeError(f"control pass is incomplete: {actual}/{total} pages")
+
+
+def compare(db, main_database: Path, output_dir: Path) -> dict[str, int]:
+    path = main_database.resolve().as_posix()
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as main:
+        main_rows = {row[0]: row[1:] for row in main.execute(
+            """SELECT id,COALESCE(NULLIF(full_name,''),list_name),registration_number FROM licenses""")}
+    control_rows = {row[0]: row[1:] for row in db.execute(
+        """SELECT license_id,min(region_code),min(list_name),min(registration_number),count(*)
+           FROM page_rows GROUP BY license_id""")}
+    region_names = dict(db.execute("SELECT code,name FROM regions"))
+    main_ids, control_ids = set(main_rows), set(control_rows)
+    missing, main_only = control_ids - main_ids, main_ids - control_ids
+    duplicates = list(db.execute(
+        """SELECT license_id,count(*),group_concat(region_code || ':' || page || ':' || position)
+           FROM page_rows GROUP BY license_id HAVING count(*)>1 ORDER BY count(*) DESC,license_id"""))
+
+    atomic_csv(output_dir / "missing_from_main.csv",
+               ([item, f"{BASE_URL}/view/{item}", control_rows[item][0],
+                 region_names.get(control_rows[item][0], ""), control_rows[item][2],
+                 control_rows[item][1], control_rows[item][3]] for item in sorted(missing)),
+               ["ID", "URL", "Код субъекта", "Субъект РФ", "Рег.номер", "Название", "Вхождений"])
+    atomic_csv(output_dir / "main_only.csv",
+               ([item, f"{BASE_URL}/view/{item}", main_rows[item][1], main_rows[item][0]]
+                for item in sorted(main_only)),
+               ["ID", "URL", "Рег.номер", "Название"])
+    atomic_csv(output_dir / "regional_duplicates.csv", duplicates,
+               ["ID", "Вхождений", "Позиции субъект:страница:позиция"])
+
+    summary = {
+        "regions": db.execute("SELECT count(*) FROM regions").fetchone()[0],
+        "pages": db.execute("SELECT count(*) FROM pages").fetchone()[0],
+        "rows": db.execute("SELECT count(*) FROM page_rows").fetchone()[0],
+        "unique_ids": len(control_ids), "also_in_main": len(control_ids & main_ids),
+        "missing_from_main": len(missing), "main_only": len(main_only),
+        "duplicate_ids": len(duplicates),
+    }
+    atomic_csv(output_dir / "summary.csv", summary.items(), ["Показатель", "Значение"])
+    return summary
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--main-db", type=Path, default=Path("data/licenses.sqlite3"))
+    parser.add_argument("--output-dir", type=Path, default=Path("control"))
+    parser.add_argument("--rate", type=int, default=1, help="additional sequential requests per second")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--curl", default="curl.exe" if os.name == "nt" else "curl")
+    args = parser.parse_args()
+    if args.rate <= 0 or args.batch_size <= 0:
+        parser.error("--rate and --batch-size must be positive")
+    if not args.main_db.is_file():
+        parser.error(f"main database not found: {args.main_db}")
+    return args
+
+
+def main() -> int:
+    args = arguments()
+    print(f"Started: {local_now()}", flush=True)
+    curl_path = shutil.which(args.curl)
+    if not curl_path:
+        raise SystemExit(f"curl not found: {args.curl}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    database = args.output_dir / "control.sqlite3"
+    curl = Curl(curl_path, args.rate, args.output_dir / ".curl-cookies.txt", workers=1)
+    with closing(sqlite3.connect(database)) as db, tempfile.TemporaryDirectory(prefix="obrnadzor-control-") as temp:
+        db.executescript(SCHEMA)
+        tempdir = Path(temp)
+        regions = discover_regions(curl, tempdir)
+        discover_totals(db, curl, regions, args.batch_size, tempdir)
+        download_pages(db, curl, args.batch_size, tempdir)
+        summary = compare(db, args.main_db, args.output_dir)
+    print("Control summary: " + ", ".join(f"{key}={value:,}" for key, value in summary.items()))
+    print(f"Control SQLite: {database}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

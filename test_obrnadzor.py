@@ -1,9 +1,12 @@
 import io
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
+from control_pass import SCHEMA as CONTROL_SCHEMA, compare, parse_regions, save_page
 from obrnadzor import Curl, Progress, Request, format_duration, parse_activities, parse_detail, parse_list
 
 
@@ -109,6 +112,31 @@ class ParserTests(unittest.TestCase):
             self.assertEqual([2, 3, 3], sorted(call[2] for call in curl.calls))
             self.assertEqual(3, len({call[1] for call in curl.calls}))
             self.assertEqual(3, len({call[3] for call in curl.calls}))
+
+    def test_control_pass_preserves_page_positions(self):
+        source = '''<select id="region"><option value="">Не выбрано</option>
+        <option value="77">г. Москва</option><option value="01">Республика Адыгея</option></select>'''
+        self.assertEqual([("77", "г. Москва"), ("01", "Республика Адыгея")], parse_regions(source))
+        duplicate = {"id": 42, "list_name": "A", "registration_number": "R", "order_text": "O",
+                     "validity": "V", "list_status": "Действующая"}
+        missing = {**duplicate, "id": 43, "list_name": "B", "registration_number": "R2"}
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            main_path = directory / "main.sqlite3"
+            with closing(sqlite3.connect(main_path)) as main:
+                main.execute("CREATE TABLE licenses(id INTEGER,full_name TEXT,list_name TEXT,registration_number TEXT)")
+                main.executemany("INSERT INTO licenses VALUES(?,?,?,?)", [(42, "A", "", "R"), (44, "C", "", "R3")])
+                main.commit()
+            with closing(sqlite3.connect(directory / "control.sqlite3")) as db:
+                db.executescript(CONTROL_SCHEMA)
+                db.execute("INSERT INTO regions VALUES(?,?,?,?)", ("77", "г. Москва", 2, "now"))
+                save_page(db, "77", 1, [duplicate, duplicate])
+                save_page(db, "77", 2, [missing])
+                self.assertEqual((3, 2), db.execute(
+                    "SELECT count(*),count(DISTINCT license_id) FROM page_rows").fetchone())
+                summary = compare(db, main_path, directory)
+            self.assertEqual((1, 1, 1),
+                             (summary["missing_from_main"], summary["main_only"], summary["duplicate_ids"]))
 
 
 if __name__ == "__main__":
