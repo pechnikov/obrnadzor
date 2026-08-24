@@ -304,6 +304,9 @@ class Curl:
             print(line, file=self.stream, flush=True)
 
     def _recover(self, request: Request, config: Path) -> None:
+        if self.interactive:
+            print(file=self.stream)
+        print(f"Timeout started: {local_now()}", file=self.stream, flush=True)
         started, retries = time.monotonic(), 0
         next_retry = started + self.cooldown
         while True:
@@ -340,6 +343,10 @@ class Curl:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def local_now() -> str:
+    return datetime.now().astimezone().isoformat(sep=" ", timespec="seconds")
 
 
 def get_meta(db, key):
@@ -605,6 +612,7 @@ def arguments():
 
 def main():
     args = arguments()
+    print(f"Started: {local_now()}", flush=True)
     curl_path = shutil.which(args.curl)
     if not curl_path:
         raise SystemExit(f"curl not found: {args.curl}")

@@ -73,6 +73,7 @@ class ParserTests(unittest.TestCase):
             request = Request(1, "https://example.invalid", directory / "1.html")
             self.assertEqual({1}, curl.fetch([request], directory))
             self.assertEqual(3, curl.calls)
+            self.assertIn("Timeout started:", curl.stream.getvalue())
             self.assertIn("Connection restored", curl.stream.getvalue())
 
     def test_curl_is_sequential_and_rate_limited(self):
