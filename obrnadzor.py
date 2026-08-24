@@ -301,6 +301,54 @@ def chunks(values: list, size: int):
         yield values[start:start + size]
 
 
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--:--"
+    seconds = max(0, round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+class Progress:
+    BAR_WIDTH = 20
+
+    def __init__(self, label: str, total: int, completed: int = 0, stream=None) -> None:
+        self.label, self.total = label, total
+        self.completed = self.initial = completed
+        self.started = time.monotonic()
+        self.stream = stream if stream is not None else sys.stdout
+        self.interactive = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.closed = False
+        self._render()
+
+    def advance(self, count: int) -> None:
+        self.completed += count
+        self._render()
+
+    def close(self) -> None:
+        if self.interactive and not self.closed:
+            print(file=self.stream, flush=True)
+        self.closed = True
+
+    def _render(self) -> None:
+        ratio = self.completed / self.total if self.total else 1.0
+        ratio = min(1.0, max(0.0, ratio))
+        elapsed = max(time.monotonic() - self.started, 1e-9)
+        current_run = self.completed - self.initial
+        speed = current_run / elapsed
+        remaining = max(0, self.total - self.completed)
+        eta = 0 if not remaining else remaining / speed if speed else None
+        filled = round(self.BAR_WIDTH * ratio)
+        bar = "#" * filled + "-" * (self.BAR_WIDTH - filled)
+        line = (f"{self.label:<14} [{bar}] {ratio:6.2%} "
+                f"{self.completed:,}/{self.total:,} | {speed:5.1f} req/s | ETA {format_duration(eta)}")
+        finished = self.completed >= self.total
+        print(f"\r{line}" if self.interactive else line, end="\n" if not self.interactive or finished else "",
+              file=self.stream, flush=True)
+        self.closed = finished
+
+
 def read_html(path: Path) -> str:
     return path.read_text(encoding="utf-8-sig", errors="replace")
 
@@ -320,12 +368,13 @@ def download_list(db, curl, scope, batch_size, max_pages, rescan):
         target = min(total_pages, max_pages) if max_pages else total_pages
         done = set() if rescan else {r[0] for r in db.execute("SELECT page FROM list_pages WHERE page<=?", (target,))}
         pending = [page for page in range(1, target + 1) if page not in done]
-        print(f"List: {target:,} pages, {len(pending):,} pending")
+        progress = Progress("List", target, target - len(pending))
         failures = 0
-        for number, batch in enumerate(chunks(pending, batch_size), 1):
+        for batch in chunks(pending, batch_size):
             requests = [Request(page, f"{BASE_URL}/search", tempdir / f"{page}.html",
                                 urlencode({"status": status, "p": page})) for page in batch]
             downloaded = curl.fetch(requests, tempdir)
+            completed = 0
             with db:
                 for request in requests:
                     if request.key not in downloaded:
@@ -343,7 +392,9 @@ def download_list(db, curl, scope, batch_size, max_pages, rescan):
                      ON CONFLICT(page) DO UPDATE SET fetched_at=excluded.fetched_at,row_count=excluded.row_count""",
                                (request.key, utc_now(), len(page_rows)))
                     request.output.unlink(missing_ok=True)
-            print(f"  list batch {number}: through page {batch[-1]:,}")
+                    completed += 1
+            progress.advance(completed)
+        progress.close()
         if failures:
             raise RuntimeError(f"{failures} list pages failed; restart the same command to resume")
 
@@ -361,13 +412,15 @@ FIELD_MAP = {
 
 def download_details(db, curl, batch_size):
     ids = [r[0] for r in db.execute("SELECT id FROM licenses WHERE detail_done=0 ORDER BY id")]
-    print(f"Details: {len(ids):,} pending")
+    total = db.execute("SELECT count(*) FROM licenses").fetchone()[0]
+    progress = Progress("Details", total, total - len(ids))
     failures = 0
     with tempfile.TemporaryDirectory(prefix="obrnadzor-details-") as temp:
         tempdir = Path(temp)
-        for number, batch in enumerate(chunks(ids, batch_size), 1):
+        for batch in chunks(ids, batch_size):
             requests = [Request(item, f"{BASE_URL}/view/{item}", tempdir / f"{item}.html") for item in batch]
             downloaded = curl.fetch(requests, tempdir)
+            completed = 0
             with db:
                 for request in requests:
                     if request.key not in downloaded:
@@ -385,20 +438,24 @@ def download_details(db, curl, batch_size):
                          name=excluded.name,status=excluded.status,order_text=excluded.order_text""",
                                    (branch["id"], request.key, branch["name"], branch["status"], branch["order_text"]))
                     request.output.unlink(missing_ok=True)
-            print(f"  details batch {number}: {min(number * batch_size, len(ids)):,}/{len(ids):,}")
+                    completed += 1
+            progress.advance(completed)
+        progress.close()
         if failures:
             raise RuntimeError(f"{failures} detail pages failed; restart the same command to resume")
 
 
 def download_activities(db, curl, batch_size):
     ids = [r[0] for r in db.execute("SELECT branch_id FROM license_branches WHERE fetched=0 ORDER BY branch_id")]
-    print(f"Activities: {len(ids):,} branch pages pending")
+    total = db.execute("SELECT count(*) FROM license_branches").fetchone()[0]
+    progress = Progress("Activities", total, total - len(ids))
     failures = 0
     with tempfile.TemporaryDirectory(prefix="obrnadzor-activities-") as temp:
         tempdir = Path(temp)
-        for number, batch in enumerate(chunks(ids, batch_size), 1):
+        for batch in chunks(ids, batch_size):
             requests = [Request(item, f"{BASE_URL}/branch/{item}", tempdir / f"{item}.html") for item in batch]
             downloaded = curl.fetch(requests, tempdir)
+            completed = 0
             with db:
                 for request in requests:
                     if request.key not in downloaded:
@@ -411,7 +468,9 @@ def download_activities(db, curl, batch_size):
                                    [(request.key, *item) for item in parse_activities(source)])
                     db.execute("UPDATE license_branches SET fetched=1 WHERE branch_id=?", (request.key,))
                     request.output.unlink(missing_ok=True)
-            print(f"  activities batch {number}: {min(number * batch_size, len(ids)):,}/{len(ids):,}")
+                    completed += 1
+            progress.advance(completed)
+        progress.close()
         if failures:
             raise RuntimeError(f"{failures} branch pages failed; restart the same command to resume")
 

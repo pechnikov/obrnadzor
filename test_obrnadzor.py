@@ -1,6 +1,7 @@
+import io
 import unittest
 
-from obrnadzor import parse_activities, parse_detail, parse_list
+from obrnadzor import Progress, format_duration, parse_activities, parse_detail, parse_list
 
 
 class ParserTests(unittest.TestCase):
@@ -35,6 +36,21 @@ class ParserTests(unittest.TestCase):
 
     def test_branch_without_active_programs(self):
         self.assertEqual([], parse_activities("<table><tr><td>Нет действующих ОП</td></tr></table>"))
+
+    def test_progress(self):
+        stream = io.StringIO()
+        progress = Progress("Details", 100, 20, stream)
+        progress.started -= 10
+        progress.advance(10)
+        output = stream.getvalue()
+        self.assertIn("30.00%", output)
+        self.assertIn("30/100", output)
+        self.assertIn("ETA", output)
+        self.assertEqual("01:01:01", format_duration(3661))
+
+        finished = io.StringIO()
+        Progress("List", 1, 1, finished)
+        self.assertIn("ETA 00:00:00", finished.getvalue())
 
 
 if __name__ == "__main__":
