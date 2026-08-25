@@ -593,9 +593,9 @@ def export_csv(db, output_dir):
             yield [current[0], f"{BASE_URL}/view/{current[0]}", *current[1:], "; ".join(dict.fromkeys(activities))]
 
     atomic_csv(output_dir / "licenses.csv", full_rows(), CSV_COLUMNS)
-    minimal = db.execute("""SELECT DISTINCT inn,COALESCE(NULLIF(full_name,''),list_name) AS name FROM licenses
+    minimal = db.execute("""SELECT inn,COALESCE(NULLIF(full_name,''),list_name) AS name FROM licenses
      WHERE COALESCE(NULLIF(status,''),list_status)='Действующая' AND inn<>''
-     AND COALESCE(NULLIF(full_name,''),list_name)<>'' ORDER BY inn,name""")
+     AND COALESCE(NULLIF(full_name,''),list_name)<>'' ORDER BY inn,name,id""")
     atomic_csv(output_dir / "active_inn_name.csv", minimal, ["ИНН", "Название"])
     print(f"CSV: {output_dir / 'licenses.csv'}\nCSV minimum: {output_dir / 'active_inn_name.csv'}")
 
