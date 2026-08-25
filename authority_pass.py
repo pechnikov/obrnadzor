@@ -49,7 +49,7 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--main-db", type=Path, default=Path("data/licenses.sqlite3"))
     parser.add_argument("--output-dir", type=Path, default=Path("recovery"))
-    parser.add_argument("--rate", type=int, default=1)
+    parser.add_argument("--rate", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--discover-only", action="store_true")
     parser.add_argument("--rescan", action="store_true",
