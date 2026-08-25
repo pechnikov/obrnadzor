@@ -103,6 +103,18 @@ python .\fill_inn.py
 сначала импортируется. После окончания обновляются штатные `data/licenses.csv`,
 `data/active_inn_name.csv`, а также контрольные `union.csv` и `union_missing_inn.csv`.
 
+Если две первые выборки не покрыли исходное число строк, выполните независимый проход по
+лицензирующим органам:
+
+```powershell
+python .\authority_pass.py
+```
+
+Проход возобновляется из `recovery/authority.sqlite3`, добавляет новые ID непосредственно в
+`data/licenses.sqlite3`, скачивает их карточки и пересобирает штатные CSV. Только узнать число
+органов и страниц можно командой `python .\authority_pass.py --discover-only`. Для ещё одной
+попытки по всем страницам используется `python .\authority_pass.py --rescan`.
+
 ## Проверка
 
 ```powershell

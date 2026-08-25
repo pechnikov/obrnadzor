@@ -7,8 +7,9 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
+from authority_pass import merge_rows
 from control_pass import (SCHEMA as CONTROL_SCHEMA, compare, discover_totals, download_pages,
-                          parse_regions, save_page)
+                          parse_options, parse_regions, save_page)
 from fill_inn import enqueue_missing, merge_details
 from obrnadzor import (SCHEMA as MAIN_SCHEMA, Curl, Progress, Request, format_duration,
                        export_csv, parse_activities, parse_detail, parse_list)
@@ -152,6 +153,23 @@ class ParserTests(unittest.TestCase):
                              [row["Источник записи"] for row in union])
             self.assertEqual(("7800000000", "регистрационный номер"),
                              (union[1]["ИНН"], union[1]["Источник ИНН"]))
+
+    def test_authority_pass_parses_and_merges_new_id(self):
+        source = '<select id="lo"><option value="1">Federal</option></select>'
+        self.assertEqual([("1", "Federal")], parse_options(source, "lo"))
+        row = {"id": 3, "list_name": "Three", "registration_number": "R3", "order_text": "O",
+               "validity": "V", "list_status": "Действующая"}
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            with closing(sqlite3.connect(directory / "control.sqlite3")) as control, closing(
+                    sqlite3.connect(directory / "main.sqlite3")) as main:
+                control.executescript(CONTROL_SCHEMA)
+                control.execute("INSERT INTO regions VALUES(?,?,?,?)", ("1", "Federal", 1, "now"))
+                save_page(control, "1", 1, [row])
+                main.executescript(MAIN_SCHEMA)
+                self.assertEqual(1, merge_rows(control, main))
+                self.assertEqual((3, "Three"), main.execute(
+                    "SELECT id,list_name FROM licenses").fetchone())
 
     def test_control_pass_refreshes_changed_region_and_accepts_last_page(self):
         def page(item, last_link):

@@ -33,19 +33,20 @@ CREATE INDEX IF NOT EXISTS control_license_idx ON page_rows(license_id);
 """
 
 
-class RegionParser(HTMLParser):
-    def __init__(self) -> None:
+class OptionParser(HTMLParser):
+    def __init__(self, select_id: str) -> None:
         super().__init__(convert_charrefs=True)
-        self.in_regions = self.in_option = False
+        self.select_id = select_id
+        self.in_select = self.in_option = False
         self.value = ""
         self.text: list[str] = []
-        self.regions: list[tuple[str, str]] = []
+        self.options: list[tuple[str, str]] = []
 
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
-        if tag == "select" and attributes.get("id") == "region":
-            self.in_regions = True
-        elif self.in_regions and tag == "option":
+        if tag == "select" and attributes.get("id") == self.select_id:
+            self.in_select = True
+        elif self.in_select and tag == "option":
             self.in_option = True
             self.value, self.text = attributes.get("value", ""), []
 
@@ -56,16 +57,20 @@ class RegionParser(HTMLParser):
     def handle_endtag(self, tag):
         if self.in_option and tag == "option":
             if self.value:
-                self.regions.append((self.value, clean("".join(self.text))))
+                self.options.append((self.value, clean("".join(self.text))))
             self.in_option = False
-        elif self.in_regions and tag == "select":
-            self.in_regions = False
+        elif self.in_select and tag == "select":
+            self.in_select = False
+
+
+def parse_options(source: str, select_id: str) -> list[tuple[str, str]]:
+    parser = OptionParser(select_id)
+    parser.feed(source)
+    return list(dict.fromkeys(parser.options))
 
 
 def parse_regions(source: str) -> list[tuple[str, str]]:
-    parser = RegionParser()
-    parser.feed(source)
-    return list(dict.fromkeys(parser.regions))
+    return parse_options(source, "region")
 
 
 def save_page(db, region_code: str, page: int, rows: list[dict]) -> None:
@@ -81,8 +86,9 @@ def save_page(db, region_code: str, page: int, rows: list[dict]) -> None:
                     for position, row in enumerate(rows, 1)])
 
 
-def search_request(key: int, region_code: str, page: int, tempdir: Path) -> Request:
-    data = urlencode({"status": "6", "region": region_code, "p": page})
+def search_request(key: int, region_code: str, page: int, tempdir: Path,
+                   filter_name: str = "region") -> Request:
+    data = urlencode({"status": "6", filter_name: region_code, "p": page})
     return Request(key, f"{BASE_URL}/search", tempdir / f"{region_code}-{page}.html", data)
 
 
@@ -96,14 +102,15 @@ def discover_regions(curl: Curl, tempdir: Path) -> list[tuple[str, str]]:
     return regions
 
 
-def discover_totals(db, curl: Curl, regions: list[tuple[str, str]], batch_size: int, tempdir: Path) -> None:
+def discover_totals(db, curl: Curl, regions: list[tuple[str, str]], batch_size: int,
+                    tempdir: Path, filter_name: str = "region", label: str = "Regions") -> None:
     old_totals = dict(db.execute("SELECT code,total_pages FROM regions"))
     pending = [(number, code, name) for number, (code, name) in enumerate(regions, 1)]
-    progress = Progress("Regions", len(regions), 0)
+    progress = Progress(label, len(regions), 0)
     failures = 0
     for start in range(0, len(pending), batch_size):
         batch = pending[start:start + batch_size]
-        requests = [search_request(number, code, 1, tempdir) for number, code, _ in batch]
+        requests = [search_request(number, code, 1, tempdir, filter_name) for number, code, _ in batch]
         downloaded = curl.fetch(requests, tempdir, progress.refresh)
         completed = 0
         with db:
@@ -134,18 +141,19 @@ def discover_totals(db, curl: Curl, regions: list[tuple[str, str]], batch_size: 
         raise RuntimeError(f"{failures} region discovery requests failed; restart to resume")
 
 
-def download_pages(db, curl: Curl, batch_size: int, tempdir: Path) -> None:
+def download_pages(db, curl: Curl, batch_size: int, tempdir: Path,
+                   filter_name: str = "region", label: str = "Regional pages") -> None:
     region_pages = list(db.execute("SELECT code,total_pages FROM regions ORDER BY code"))
     total = sum(row[1] for row in region_pages)
     completed = db.execute("SELECT count(*) FROM pages").fetchone()[0]
-    progress = Progress("Regional pages", total, completed)
+    progress = Progress(label, total, completed)
     failures = 0
     for code, total_pages in region_pages:
         done = {row[0] for row in db.execute("SELECT page FROM pages WHERE region_code=?", (code,))}
         pending = [page for page in range(1, total_pages + 1) if page not in done]
         for start in range(0, len(pending), batch_size):
             batch = pending[start:start + batch_size]
-            requests = [search_request(page, code, page, tempdir) for page in batch]
+            requests = [search_request(page, code, page, tempdir, filter_name) for page in batch]
             downloaded = curl.fetch(requests, tempdir, progress.refresh)
             batch_completed = 0
             with db:
